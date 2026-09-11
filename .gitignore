@@ -1,0 +1,32 @@
+# 依赖（实际安装在状态目录，这里只做兜底）
+node_modules/
+
+# 本地状态与调试产物（真实状态在 OS 状态目录：%LOCALAPPDATA%\grok-brain）
+.dsb-state/
+debug/
+*.log
+
+# 文档目录：只留本地，不进版本库
+.doc/
+
+# 系统
+.DS_Store
+Thumbs.db
+# Secret Guard: credentials and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Secret Guard: databases and backups
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.bak
+*.bak-*
+*.backup
+*.dump
+backups/

@@ -1,0 +1,13 @@
+{
+  "name": "qwb",
+  "version": "3.0.0",
+  "private": true,
+  "type": "module",
+  "description": "qwen-brain 机制层：驱动 qianwen.com 网页版的确定性 CLI",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "playwright-core": "^1.40.0"
+  }
+}
