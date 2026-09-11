@@ -8,7 +8,13 @@ import { parseArgs } from "node:util";
 import { VERSION, dirs, ensureDir, writeJson, readJson, workspaceId, nowIso } from "./src/paths.mjs";
 import { log, tailLines } from "./src/logger.mjs";
 import { sanitizeOutbound } from "./src/sanitize.mjs";
-import { getSession, setSession, appendAudit, saveDebugHtml } from "./src/session.mjs";
+import {
+  getSession,
+  setSession,
+  appendAudit,
+  saveDebugHtml,
+  acquireLock,
+} from "./src/session.mjs";
 import {
   launchBrowser,
   findBrowser,
@@ -16,7 +22,8 @@ import {
   depsEntry,
   exportStorageState,
   readLoginCookies,
-  openPage,
+  collapseToSinglePage,
+  closeBrowser,
 } from "./src/browser.mjs";
 import * as site from "./src/site.mjs";
 
@@ -45,6 +52,7 @@ const { values: flags, positionals } = parseArgs({
     "captcha-wait": { type: "string", default: "180000" },
     verbose: { type: "boolean", default: false },
     lines: { type: "string" },
+    n: { type: "string" },
     force: { type: "boolean", default: false },
     url: { type: "string" },
     title: { type: "string" },
@@ -99,8 +107,73 @@ function printHuman(payload) {
   }
 }
 
+
+/**
+ * 打开浏览器的命令共用入口：先拿全局会话锁（profile 是排他资源，且孤儿浏览器
+ * 回收必须持锁进行，否则会误杀另一会话的窗口），再执行，finally 释放。
+ */
+async function withBrowserLock(command, fn) {
+  const lock = acquireLock({ command });
+  if (!lock.ok) {
+    return fail(
+      "LOCKED",
+      `另一个 qwb 会话正在运行（pid=${lock.holder?.pid ?? "?"}，${lock.holder?.command ?? "?"}），同一时间只允许一个会话占用浏览器。等它结束后再试。`,
+      { holder: lock.holder ?? null, lockFile: lock.lockFile }
+    );
+  }
+  try {
+    return await fn();
+  } finally {
+    lock.release();
+  }
+}
+
 function newRequestId() {
   return `qwb_${crypto.randomBytes(2).toString("hex")}`;
+}
+
+/* ------------------------- 滑块验证：提示与失败文案 ------------------------- */
+
+/**
+ * 阿里风控提示。原则（用户明确要求）：
+ *   - 滑块一律由用户本人在浏览器里拖动，CLI **只等待，绝不代拖**；
+ *   - 不能干等 —— 每次触发都要在终端讲清楚：触发了风控、需要人工验证、还剩多少时间。
+ */
+function captchaNotice(scene, waitMs) {
+  process.stderr.write(
+    `⚠️  ${scene}：触发了阿里风控，需要人工验证。\n` +
+      `   请在打开的浏览器窗口里手动拖动滑块（CLI 不代拖，只等待，最多 ${Math.round(waitMs / 1000)} 秒）。\n` +
+      "   通过后设备会被记住，一般会安静一段时间；若频繁弹出，建议降低提问频率或稍后再试。\n"
+  );
+}
+
+function captchaFailMessage(waitMs) {
+  return (
+    `滑块验证未在 ${Math.round(waitMs / 1000)} 秒内完成（风控要求人工操作，CLI 不会代拖）。` +
+    "重跑同一条命令，出现滑块时尽快拖动即可；频繁触发时建议过段时间再试。"
+  );
+}
+
+/* --------------------------- 中断清理（防孤儿窗口） --------------------------- */
+
+/**
+ * 进程被 Ctrl-C / kill / 任务取消时，Node 直接退出会**留下一个孤儿 Chrome 窗口**
+ * （实测：上游取消任务后窗口一直挂着，用户看到「怎么打开了这么多」）。
+ * 这里注册信号处理，退出前优雅关闭浏览器。
+ */
+let activeCtx = null;
+let cleaningUp = false;
+async function cleanupAndExit(signal) {
+  if (cleaningUp) return;
+  cleaningUp = true;
+  process.stderr.write(`\n收到 ${signal}，正在关闭浏览器…\n`);
+  if (activeCtx) await closeBrowser(activeCtx).catch(() => {});
+  process.exit(130);
+}
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(sig, () => {
+    cleanupAndExit(sig);
+  });
 }
 
 /* ------------------------------ [QWB] 协议 ------------------------------ */
@@ -151,8 +224,9 @@ function installDeps() {
  */
 async function waitLoginFlow({ timeoutMs }) {
   const ctx = await launchBrowser({ headless: false });
+  activeCtx = ctx;
   try {
-    const page = await openPage(ctx);
+    const page = await collapseToSinglePage(ctx);
     await site.gotoSite(page);
     process.stderr.write("浏览器已打开。请完成千问登录（手机号 / 支付宝 / 阿里云账号，需你本人操作）。\n");
     process.stderr.write("（匿名模式也可用；登录是为了解锁视频生成与同步对话记录，可直接关闭浏览器跳过。）\n");
@@ -188,7 +262,7 @@ async function waitLoginFlow({ timeoutMs }) {
     writeJson(d.prefs, { ...prefs, lastLoginAt: nowIso() });
     return { ok: true, loginState: "logged-in", url: page.url(), loginCookies: ck.loginCookies, storageState: exported };
   } finally {
-    await ctx.close().catch(() => {}); // 优雅关闭：确保 cookie 落盘
+    await closeBrowser(ctx); // 优雅关闭：确保 cookie 落盘
   }
 }
 
@@ -203,7 +277,7 @@ async function cmdSetup() {
   const br = findBrowser();
   if (!br) return fail("DEPENDENCY_MISSING", "未找到系统 Chrome / Edge；请安装其一后重试。");
 
-  const res = await waitLoginFlow({ timeoutMs: Number(flags.timeout ?? 1800000) });
+  const res = await withBrowserLock("setup", () => waitLoginFlow({ timeoutMs: Number(flags.timeout ?? 1800000) }));
   if (!res.ok) {
     if (res.reason === "LOGIN_ABORTED") return emit({ ok: true, loginState: "anonymous", note: "未登录（匿名模式可用）；要解锁视频生成与同步请再跑 qwb login" });
     return fail(res.reason, "等待登录超时，请重试。", res);
@@ -212,7 +286,7 @@ async function cmdSetup() {
 }
 
 async function cmdLogin() {
-  const res = await waitLoginFlow({ timeoutMs: Number(flags.timeout ?? 1800000) });
+  const res = await withBrowserLock("login", () => waitLoginFlow({ timeoutMs: Number(flags.timeout ?? 1800000) }));
   if (!res.ok) return fail(res.reason, "登录未完成，请重试。", res);
   return emit({ ok: true, ...res });
 }
@@ -233,6 +307,11 @@ async function cmdLogout() {
 /* --------------------------------- doctor --------------------------------- */
 
 async function cmdDoctor() {
+  // 只有 --deep 会开浏览器，需要锁；轻量体检直接跑
+  return flags.deep ? withBrowserLock("doctor --deep", () => cmdDoctorInner()) : cmdDoctorInner();
+}
+
+async function cmdDoctorInner() {
   const checks = [];
   const nodeMajor = Number(process.versions.node.split(".")[0]);
   checks.push({ name: "node", ok: nodeMajor >= 20, detail: process.version });
@@ -273,8 +352,9 @@ async function cmdDoctor() {
       deep = { skipped: true, reason: "DEPENDENCY_MISSING" };
     } else {
       const ctx = await launchBrowser({ headless: !!flags.headless });
+      activeCtx = ctx;
       try {
-        const page = await openPage(ctx);
+        const page = await collapseToSinglePage(ctx);
         await site.gotoSite(page);
         const st = await site.pageState(page);
         const cookies = await readLoginCookies(ctx);
@@ -286,7 +366,7 @@ async function cmdDoctor() {
         deep.screenshot = shot;
         if (flags.html) deep.htmlFile = saveDebugHtml(await page.content(), "doctor");
       } finally {
-        await ctx.close();
+        await closeBrowser(ctx);
       }
     }
   }
@@ -302,6 +382,7 @@ async function cmdDoctor() {
   }
   if (deep && !deep.skipped) {
     if (deep.state.challenge) {
+      captchaNotice("doctor --deep 真机探测", Number(flags["captcha-wait"] ?? 180000));
       ok = false;
       reason = "HUMAN_VERIFICATION_REQUIRED";
     } else if (deep.state.rateLimited) {
@@ -319,6 +400,10 @@ async function cmdDoctor() {
 /* ----------------------------------- ask ---------------------------------- */
 
 async function cmdAsk() {
+  return withBrowserLock("ask", () => cmdAskInner());
+}
+
+async function cmdAskInner() {
   const wsid = workspaceId();
   const session = getSession(wsid);
 
@@ -363,6 +448,7 @@ async function cmdAsk() {
   let ctx;
   try {
     ctx = await launchBrowser({ headless: !!flags.headless });
+    activeCtx = ctx;
   } catch (error) {
     return fail(error.code ?? "DEPENDENCY_MISSING", error.message);
   }
@@ -370,16 +456,24 @@ async function cmdAsk() {
   const downloadsDir = ensureDir(path.join(dirs().downloads, wsid));
 
   try {
-    const page = await openPage(ctx);
+    const page = await collapseToSinglePage(ctx);
     const completion = site.watchCompletion(page);
 
     await site.gotoSite(page, targetUrl);
 
     let st = await site.pageState(page);
     if (st.challenge) {
-      process.stderr.write("页面出现滑块验证，请在浏览器里完成一次拖动…\n");
-      const w = await site.waitForChallengeCleared(page, { timeoutMs: captchaWaitMs });
-      if (!w.cleared) return fail("HUMAN_VERIFICATION_REQUIRED", "滑块验证未在时限内完成，请重试。", { state: st });
+      captchaNotice("页面加载时就带出了滑块验证", captchaWaitMs);
+      const w = await site.waitForChallengeCleared(page, {
+        timeoutMs: captchaWaitMs,
+        onTick: ({ remainingMs }) =>
+          process.stderr.write(
+            `  …仍在等待人工验证（滑块），剩余 ${Math.round(remainingMs / 1000)} 秒。` +
+              "验证窗口若已关闭请重跑本命令；频繁触发时建议降低提问频率。\n"
+          ),
+      });
+      if (!w.cleared) return fail("HUMAN_VERIFICATION_REQUIRED", captchaFailMessage(captchaWaitMs), { state: st });
+      process.stderr.write("✓ 人工验证通过，继续。\n");
       st = await site.pageState(page);
     }
     if (st.rateLimited) return fail("RATE_LIMITED", "千问提示请求过于频繁，请稍后再试。", { retryAfterMs: 300000 });
@@ -410,22 +504,15 @@ async function cmdAsk() {
       }
     }
 
-    // 附件上传（qianwen 用隐藏 input[type=file]，aria=添加附件 按钮触发）
+    // 附件上传（点击「添加附件」→ 接住 filechooser 事件；页面常驻 DOM 无 input[type=file]）
     if (flags.attach) {
       const files = String(flags.attach).split(",").map((s) => s.trim()).filter(Boolean);
       for (const f of files) {
         if (!fs.existsSync(f)) return fail("INVALID_ARGUMENTS", `附件不存在：${f}`);
       }
-      const input = page.locator('input[type="file"]').first();
-      if ((await page.locator('input[type="file"]').count()) === 0) {
-        return fail("UPLOAD_REJECTED", "页面上没有文件输入框");
-      }
-      try {
-        await input.setInputFiles(files, { timeout: 60000 });
-        await page.waitForTimeout(4000);
-      } catch (error) {
-        return fail("UPLOAD_REJECTED", `附件上传失败：${error.message}`);
-      }
+      const up = await site.uploadAttachments(page, files);
+      if (!up.ok) return fail(up.reason, up.message);
+      log("info", `附件已上传 ${up.count} 个`);
     }
 
     // 发送前记录回答数基线：只认「新增的回答气泡」
@@ -442,16 +529,24 @@ async function cmdAsk() {
       timeoutMs,
       completion,
       minAnswers: baseline.answerCount ?? 0,
-      onChallenge: () => {
-        process.stderr.write("发送触发滑块验证，请在浏览器里完成拖动（通过后会自动重发）…\n");
+      challengeWaitMs: captchaWaitMs,
+      onChallenge: ({ phase }) => {
+        if (phase === "pending") {
+          captchaNotice("发送后触发了滑块验证（该消息可能被风控拦截）", captchaWaitMs);
+          process.stderr.write("   提示：通过验证后 CLI 会自动重发这条消息，无需手动操作。\n");
+        } else if (phase === "cleared") {
+          process.stderr.write("✓ 人工验证通过，继续等待回答…\n");
+        }
       },
       onPoll: (info) => log("debug", "waitForAnswer poll", info),
     }).catch((e) => ({ ok: false, reason: "INTERNAL_ERROR", message: String(e).slice(0, 200) }));
-    completion.dispose();
 
-    // 千问特性：验证会拦住已发出的消息（回答停在生成中占位）。验证通过后需重发一次。
-    if (ans.reason === "STREAM_STALLED" && ans.challenge) {
-      process.stderr.write("验证已通过，重发消息…\n");
+    // 千问特性：验证会拦住已发出的消息（回答停在生成中占位、不会自动恢复）。
+    // 验证通过后立即重发一次（不等满 timeout）。
+    // ⚠️ completion 必须活着到重发结束（dispose 后状态不再更新，重发会永远等不到 netIdle）。
+    if (ans.reason === "STREAM_STALLED" && ans.challenge && ans.cleared) {
+      process.stderr.write("验证通过后回答未恢复（该消息已被打断），正在重发…\n");
+      completion.reset();
       await site.startNewChat(page).catch(() => {});
       const inj2 = await site.injectPrompt(page, subject).catch(() => ({ ok: false }));
       if (inj2.ok) {
@@ -461,13 +556,18 @@ async function cmdAsk() {
           timeoutMs,
           completion,
           minAnswers: baseline2.answerCount ?? 0,
-          onPoll: (info) => log("debug", "waitForAnswer poll", info),
+          challengeWaitMs: captchaWaitMs,
+          onChallenge: ({ phase }) => {
+            if (phase === "pending") captchaNotice("重发时再次触发滑块验证", captchaWaitMs);
+            else if (phase === "cleared") process.stderr.write("✓ 人工验证通过，继续等待回答…\n");
+          },
+          onPoll: (info) => log("debug", "waitForAnswer poll(resend)", info),
         }).catch((e) => ({ ok: false, reason: "INTERNAL_ERROR", message: String(e).slice(0, 200) }));
-        completion.dispose();
         reSent = true;
-        Object.assign(ans, ans2);
+        Object.assign(ans, ans2, ans2.ok ? {} : { reSentFailed: true });
       }
     }
+    completion.dispose();
 
     if (flags.debug || !ans.ok) {
       const tag = ans.ok ? "ask" : "ask-timeout";
@@ -485,6 +585,12 @@ async function cmdAsk() {
     }
 
     if (!ans.ok && !ans.text && !files.length) {
+      if (ans.reason === "HUMAN_VERIFICATION_REQUIRED") {
+        return fail("HUMAN_VERIFICATION_REQUIRED", captchaFailMessage(captchaWaitMs), {
+          threadUrl: ans.url,
+          captchaWaitMs,
+        });
+      }
       return fail(ans.reason ?? "STREAM_STALLED", ans.message ?? "等待回答超时，且没有抓到文本或产物。", { threadUrl: ans.url });
     }
 
@@ -537,7 +643,8 @@ async function cmdAsk() {
       protocol: protocolState ? { sent: protocolState, taskId, iteration, reply: protocolReply } : undefined,
     });
   } finally {
-    if (!flags["keep-open"]) await ctx.close().catch(() => {});
+    if (!flags["keep-open"]) await closeBrowser(ctx);
+    activeCtx = null;
   }
 }
 
@@ -591,7 +698,8 @@ function cmdSession() {
 }
 
 function cmdLogs() {
-  const lines = tailLines(Number(flags.lines ?? 50), { verbose: !!flags.verbose });
+  const n = Number(flags.n ?? flags.lines ?? 50);
+  const lines = tailLines(Number.isFinite(n) && n > 0 ? n : 50, { verbose: !!flags.verbose });
   if (json) return emit({ ok: true, lines });
   process.stdout.write(`${lines.join("\n")}\n`);
   return { ok: true };
@@ -611,20 +719,26 @@ function cmdUpdateCheck() {
 
 /** 列出当前模式档位（快速 / 思考研究） */
 async function cmdListModels() {
+  return withBrowserLock("list-models", () => cmdListModelsInner());
+}
+
+async function cmdListModelsInner() {
   let ctx;
   try {
     ctx = await launchBrowser({ headless: !!flags.headless });
+    activeCtx = ctx;
   } catch (error) {
     return fail(error.code ?? "DEPENDENCY_MISSING", error.message);
   }
   try {
-    const page = await openPage(ctx);
+    const page = await collapseToSinglePage(ctx);
     await site.gotoSite(page);
     const res = await site.listModes(page);
     if (!res.ok) return fail(res.reason ?? "SITE_CHANGED", res.message ?? "未读到模式列表", { current: res.current });
     return emit({ ok: true, current: res.current, options: res.options });
   } finally {
-    await ctx.close().catch(() => {});
+    await closeBrowser(ctx);
+    activeCtx = null;
   }
 }
 

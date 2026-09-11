@@ -86,15 +86,23 @@ export async function waitForEditor(page, { timeoutMs = 1800000, pollMs = 3000, 
 }
 
 /** 等滑块验证消失（用户在浏览器里完成）。返回是否在时限内通过。 */
-export async function waitForChallengeCleared(page, { timeoutMs = 300000, pollMs = 3000, onWait } = {}) {
+export async function waitForChallengeCleared(page, { timeoutMs = 300000, pollMs = 3000, onWait, onTick } = {}) {
   const started = Date.now();
   let first = true;
+  let lastTick = 0;
   while (Date.now() - started < timeoutMs) {
     const st = await page.evaluate(STATE_FN).catch(() => null);
     if (!st?.challenge) return { cleared: true, waitedMs: Date.now() - started };
+    const elapsed = Date.now() - started;
     if (first) {
       first = false;
-      onWait?.();
+      onWait?.({ timeoutMs });
+    }
+    // 每 20 秒报一次剩余时间，避免用户面对一个「卡住」的窗口不知道还能等多久
+    const sec = Math.round(elapsed / 1000);
+    if (sec - lastTick >= 20) {
+      lastTick = sec;
+      onTick?.({ elapsedMs: elapsed, remainingMs: timeoutMs - elapsed });
     }
     await page.waitForTimeout(pollMs);
   }
@@ -138,6 +146,53 @@ export async function sendPrompt(page) {
     await page.waitForTimeout(1500);
     return { ok: true, method: "enter" };
   }
+}
+
+/**
+ * 附件上传。千问的入口是 `button[aria-label="添加附件"]`，但点它**不直接**弹文件选择，
+ * 而是先弹菜单：`[role=menuitem]`「上传文档」/「上传图片」（实测 2026-09）；
+ * 点菜单项才触发 filechooser。常驻 DOM 里没有 `input[type=file]`，
+ * 直接 setInputFiles 必报「页面上没有文件输入框」。
+ * 图片扩展名走「上传图片」，其余走「上传文档」；混合时分组各传一次。
+ */
+const ATTACH_IMAGE_RE = /\.(png|jpe?g|gif|webp|bmp|svg|heic|heif|avif|ico)$/i;
+
+export async function uploadAttachments(page, files) {
+  const btn = page.locator('button[aria-label="添加附件"]').first();
+  if ((await btn.count()) === 0) {
+    return { ok: false, reason: "UPLOAD_REJECTED", message: "页面上没有「添加附件」按钮（可能改版）" };
+  }
+  const images = files.filter((f) => ATTACH_IMAGE_RE.test(f));
+  const docs = files.filter((f) => !ATTACH_IMAGE_RE.test(f));
+  const groups = [];
+  if (images.length) groups.push(["上传图片", images]);
+  if (docs.length) groups.push(["上传文档", docs]);
+
+  let done = 0;
+  for (const [menuItem, group] of groups) {
+    let chooser;
+    try {
+      [chooser] = await Promise.all([
+        page.waitForEvent("filechooser", { timeout: 15000 }),
+        (async () => {
+          await btn.click({ timeout: 10000 });
+          await page.waitForTimeout(800);
+          const item = page.locator('[role="menuitem"]', { hasText: menuItem }).first();
+          await item.click({ timeout: 8000 });
+        })(),
+      ]);
+    } catch (error) {
+      return { ok: false, reason: "UPLOAD_REJECTED", message: `打不开文件选择器（${menuItem}）：${String(error).slice(0, 150)}` };
+    }
+    try {
+      await chooser.setFiles(group);
+    } catch (error) {
+      return { ok: false, reason: "UPLOAD_REJECTED", message: `附件上传失败（${menuItem}）：${String(error).slice(0, 150)}` };
+    }
+    done += group.length;
+    await page.waitForTimeout(4000); // 等前端把附件渲染成 chip
+  }
+  return { ok: true, count: done };
 }
 
 /* ---------------------------------- 模型选择器 -------------------------------- */
@@ -268,6 +323,11 @@ export function watchCompletion(page, urlParts = COMPLETION_URL_PARTS) {
  * 回答区状态（真机验证 2026-09，CSS Modules 随机后缀 → 必须 [class*=] 前缀匹配）：
  *   - 用户消息：`question-text-card`
  *   - 回答容器：`answers-card-wrap` / `answer-common-card`（生成中是 `answer-receiving-card`）
+ *
+ * ⚠️ 回答容器里除了正文还会挂**卡片**（`data-card-type` / `class="card card_card_*"`）：
+ *   知识视频推荐（`video_note_list`）、相关推荐等。它们的可见文本（标题）会被朴素遍历
+ *   当成正文抓进来（实测：正文末尾粘上「1+1一定等于2吗？换个规则就变了」这种视频标题）。
+ *   抽取时必须**整棵子树跳过**卡片节点。
  */
 export const EXTRACT_FN = () => {
   const vis = (el) => !!el && el.getClientRects().length > 0 && el.getAttribute("aria-hidden") !== "true";
@@ -277,6 +337,35 @@ export const EXTRACT_FN = () => {
       .replace(/[ \t]+$/gm, "")
       .replace(/\n{3,}/g, "\n\n")
       .trim();
+
+  /** 非正文卡片（推荐 / 视频 / 插件卡）：整棵子树跳过，不采集其文本 */
+  const isCardNode = (el) =>
+    el.hasAttribute("data-card-type") ||
+    el.hasAttribute("data-qianwen-card") ||
+    el.hasAttribute("data-tpl") ||
+    el.getAttribute("data-c") === "result_card" ||
+    /(^|\s)card(\s|$)|(^|\s)card_card_/.test(el.getAttribute("class") ?? "");
+
+  /**
+   * 代码块：`<pre>` 里带行号 span（`linenumber`）+ 外层固定头（语言名 / 编辑 / 复制按钮）。
+   * 朴素遍历会把它们一起抓进来（实测：正文里出现「python / 编辑 / 1def ...」）。
+   * 这里单独渲染：跳过行号，正文用 ``` 围栏包住。
+   */
+  const codeBlockText = (pre) => {
+    const lines = [];
+    for (const lineNode of pre.querySelectorAll(":scope > code > span, :scope > code > div")) {
+      const clone = lineNode.cloneNode(true);
+      for (const ln of clone.querySelectorAll('[class*="linenumber"]')) ln.remove();
+      const t = (clone.innerText ?? clone.textContent ?? "").replace(/\n+$/, "");
+      lines.push(t);
+    }
+    const body = (lines.length ? lines.join("\n") : pre.innerText ?? pre.textContent ?? "").replace(/\n+$/, "");
+    // 语言名在代码块固定头里（pre 的前一个兄弟节点的首行），形如 python / js / c++；取不到就不标
+    let lang = "";
+    const head = pre.parentElement?.previousElementSibling?.innerText?.split("\n")[0]?.trim() ?? "";
+    if (/^[a-z0-9+#]{1,15}$/i.test(head)) lang = head.toLowerCase();
+    return `\n\`\`\`${lang}\n${body}\n\`\`\`\n`;
+  };
 
   const collectText = (node) => {
     let out = "";
@@ -288,8 +377,16 @@ export const EXTRACT_FN = () => {
       }
       if (child.nodeType !== 1) continue;
       const el = child;
+      if (isCardNode(el)) continue;
       const tag = el.tagName.toLowerCase();
       if (tag === "script" || tag === "style") continue;
+      // 代码块固定头（语言名 + 编辑/复制按钮）：sticky 条 + 内含按钮，不属正文
+      const cls = el.getAttribute("class") ?? "";
+      if (/\bsticky\b/.test(cls) && el.querySelector?.("button") && (el.innerText ?? "").length < 40) continue;
+      if (tag === "pre") {
+        out += codeBlockText(el);
+        continue;
+      }
       if (tag === "sup" || tag === "sub") {
         out += collectText(el);
         continue;
@@ -349,19 +446,40 @@ export async function snapshotMarkers(page) {
 /**
  * 等本次回答完成：网络结束 + 文本连续 N 次采样不变 + 只认新增回答。
  * minAnswers：发送前的回答数基线（页面可能恢复旧会话，必须只认新增）。
- * 期间出现滑块验证 → onChallenge 回调（由调用方决定等用户还是失败）。
+ *
+ * 滑块的三种状态都要有确定行为（真机验证过的坑：验证会拦住已发出的消息，
+ * 回答卡在生成中占位、**不会自动恢复**）：
+ *   1. 等用户拖动期间 —— **回答超时时钟暂停**（否则用户拖 2 分钟就把 300 秒预算烧掉一半）；
+ *   2. 验证通过后 —— 只给 challengeGraceMs 宽限；仍无正文就立刻返回
+ *      `reason:STREAM_STALLED + challenge:true + cleared:true`，由上层**马上重发**
+ *      （旧实现是硬等满 timeout 才重发，用户拖完还得白等几分钟）；
+ *   3. 一直没拖动 —— 超过 challengeWaitMs 返回 `HUMAN_VERIFICATION_REQUIRED`，不再重发。
  */
 export async function waitForAnswer(
   page,
-  { timeoutMs = 300000, pollMs = 2000, stableSamples = 3, completion = null, minAnswers = 0, onPoll, onChallenge } = {}
+  {
+    timeoutMs = 300000,
+    pollMs = 2000,
+    stableSamples = 3,
+    completion = null,
+    minAnswers = 0,
+    challengeWaitMs = 180000,
+    challengeGraceMs = 15000,
+    onPoll,
+    onChallenge,
+  } = {}
 ) {
   const started = Date.now();
+  let pausedMs = 0;
+  let challengeStartedAt = null;
+  let challengeClearedAt = null;
+  let challengeSeen = false;
   let last = "";
   let stable = 0;
   let lastState = null;
-  let challengeSeen = false;
+  const activeElapsed = () => Date.now() - started - pausedMs;
 
-  while (Date.now() - started < timeoutMs) {
+  while (activeElapsed() < timeoutMs) {
     lastState = await page.evaluate(EXTRACT_FN).catch(() => null);
     const st = await page.evaluate(STATE_FN).catch(() => null);
     const cs = completion?.state ?? { seen: false, done: false, failed: false };
@@ -370,11 +488,28 @@ export async function waitForAnswer(
     if (st?.challenge) {
       if (!challengeSeen) {
         challengeSeen = true;
-        onChallenge?.();
+        challengeStartedAt = Date.now();
+        onChallenge?.({ phase: "pending" });
+      }
+      if (Date.now() - challengeStartedAt > challengeWaitMs) {
+        return {
+          ok: false,
+          reason: "HUMAN_VERIFICATION_REQUIRED",
+          challenge: true,
+          pending: true,
+          ...(lastState ?? {}),
+          elapsedMs: activeElapsed(),
+        };
       }
       onPoll?.({ challenge: true });
       await page.waitForTimeout(pollMs);
       continue;
+    }
+
+    if (challengeStartedAt && challengeClearedAt === null) {
+      challengeClearedAt = Date.now();
+      pausedMs += challengeClearedAt - challengeStartedAt; // 用户拖动的时间不计入回答超时
+      onChallenge?.({ phase: "cleared" });
     }
 
     if (lastState) {
@@ -390,18 +525,38 @@ export async function waitForAnswer(
         fresh,
         net: `${cs.seen ? "seen" : "-"}/${cs.done ? "done" : cs.failed ? "failed" : "-"}`,
         streaming: lastState.stopVisible,
+        challenge: challengeClearedAt ? "cleared" : undefined,
       });
 
-      if (fresh && netIdle && t.length > 0 && stable >= stableSamples) {
-        return { ok: true, ...lastState, mode: "chat", elapsedMs: Date.now() - started };
+      // 验证通过后仍拿不到正文（消息被 punish 卡在占位）→ 立刻交给上层重发
+      if (challengeClearedAt && t.length === 0 && Date.now() - challengeClearedAt > challengeGraceMs) {
+        return {
+          ok: false,
+          reason: "STREAM_STALLED",
+          challenge: true,
+          cleared: true,
+          ...lastState,
+          elapsedMs: activeElapsed(),
+        };
       }
-      if (fresh && netIdle && !lastState.stopVisible && Date.now() - started > 20000 && stable >= 2) {
-        return { ok: true, ...lastState, mode: "chat", elapsedMs: Date.now() - started };
+
+      if (fresh && netIdle && t.length > 0 && stable >= stableSamples) {
+        return { ok: true, ...lastState, mode: "chat", elapsedMs: activeElapsed() };
+      }
+      if (fresh && netIdle && !lastState.stopVisible && activeElapsed() > 20000 && stable >= 2) {
+        return { ok: true, ...lastState, mode: "chat", elapsedMs: activeElapsed() };
       }
     }
     await page.waitForTimeout(pollMs);
   }
-  return { ok: false, reason: "STREAM_STALLED", ...(lastState ?? {}), challenge: challengeSeen || undefined, elapsedMs: Date.now() - started };
+  return {
+    ok: false,
+    reason: "STREAM_STALLED",
+    ...(lastState ?? {}),
+    challenge: challengeSeen || undefined,
+    cleared: challengeClearedAt ? true : undefined,
+    elapsedMs: activeElapsed(),
+  };
 }
 
 /** 开新对话：点侧栏「新建对话」。 */

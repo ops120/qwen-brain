@@ -256,14 +256,14 @@ qwb thread status --json
 
 | reason | 含义 | 动作 |
 | --- | --- | --- |
-| `HUMAN_VERIFICATION_REQUIRED` | 滑块验证未在 `--captcha-wait` 时限内完成 | 让用户拖完重试，或加大时限 |
+| `HUMAN_VERIFICATION_REQUIRED` | 滑块验证未在 `--captcha-wait` 时限内完成（等待期间 CLI 会提醒且不计入超时；**绝不代拖**） | 让用户拖完重试，或加大时限 |
 | `RATE_LIMITED` | 限流 / 游客额度用尽 | 退避；游客被限时建议登录 |
 | `SITE_CHANGED` / `COMPOSER_NOT_FOUND` | 站点改版 | `doctor --deep` 确认后提 issue 等发版 |
 | `SEND_FAILED` | 发送 / 注入失败 | 重试一次 |
 | `STREAM_STALLED` | 超时（思考研究 1–3 分钟属正常） | 标注「可能截断」；确认 `--timeout` 足够 |
 | `UPLOAD_REJECTED` | 附件被拒 | 检查格式与大小 |
 | `THREAD_LOST` | 会话 404 | 新会话重问（或 HANDOFF） |
-| `LOCKED` | 浏览器被占用 | 等，或问用户 |
+| `LOCKED` | 另一个 qwb 会话持有全局锁（profile 是浏览器排他资源） | 等持锁会话结束（失败信息带 pid 与命令）；持有进程已死的陈旧锁会自动接管 |
 | `DEPENDENCY_MISSING` | 依赖缺失 | 运行 `setup` |
 | `SENSITIVE_BLOCKED` | 闸门拦截 | 移除敏感内容；确需发送须用户同意 |
 | `PAYLOAD_TOO_LARGE` | 正文超 50 KB | 摘要或分片；`--allow-large` 放宽到 200 KB |
@@ -309,11 +309,14 @@ Linux    $XDG_STATE_HOME/qwen-brain/
 ```
 你 / Agent ──调用──▶ qwb CLI ──Playwright──▶ 持久 Chrome ──▶ qianwen.com
                         │
+                        ├─ 全局会话锁：同一时间只允许一个会话开浏览器（并发报 LOCKED）
                         ├─ 发送前：确定性净化闸门
                         ├─ 输入框：contenteditable → keyboard.insertText 一次性注入
                         ├─ 等待：/api/v2/chat 网络信号 + 文本稳定性 + 只认新增回答
-                        ├─ 滑块验证：检测 → 等用户完成 → 自动重发
-                        └─ 抽取：[class*="answer-common-card"]（CSS Modules 前缀匹配）
+                        ├─ 滑块验证：检测 → 终端提醒（触发风控，需人工验证）→ 等用户拖动
+                        │   （等待不计入回答超时）→ 通过后立即自动重发；CLI 绝不代拖
+                        └─ 抽取：[class*="answer-common-card"]（CSS Modules 前缀匹配），
+                            剔除推荐卡片 / 代码块 chrome / 行号
 ```
 
 ### 真机验证过的坑（别再踩）
@@ -335,6 +338,22 @@ Linux    $XDG_STATE_HOME/qwen-brain/
 7. **页面会恢复上次会话**：与同族一样，`--thread new` 显式点「新建对话」，
    且等待回答只认发送后**新增**的回答卡片。
 8. **游客会话不进云空间**：URL 是游客会话，关了就找不回；重要任务登录后跑。
+9. **不要加 `--restore-last-session`**：千问登录 cookie 是持久型（365 天 Expires），
+   不需要这个「恢复上次会话」的 workaround；加了反而会在每次启动时恢复上次全部标签页，
+   而 CLI 每次问答又新开一个标签 → 标签页逐次累加（实测：跑十几次后窗口里堆了二十多个）。
+   现在的做法：不加开关 + 启动时收敛到单标签 + 持锁回收孤儿浏览器进程
+   （CLI 被强杀残留的窗口会占用 profile 排他锁，下次启动前清掉）。
+10. **附件是「两步菜单」**：`添加附件` 按钮点了不直接弹文件选择，先弹
+    「上传文档 / 上传图片」菜单（`[role=menuitem]`），点菜单项才触发 filechooser；
+    常驻 DOM 没有 `input[type=file]`，直接 `setInputFiles` 必报
+    「页面上没有文件输入框」（实测踩过）。
+11. **回答正文有三类污染**（EXTRACT_FN 已内置处理，新写抽取前先读
+    `references/site-map.md` 的「回答正文抽取的三类污染」）：
+    推荐视频卡片标题、代码块的固定头与行号、以及各类 `data-card-*` 卡片。
+12. **滑块期间超时时钟要暂停**：用户拖滑块多久都不该烧 `--timeout` 预算；
+    验证通过后回答若未恢复（消息已被拦），应**立即**重发——硬等满 timeout 才重发
+    是旧实现的坑。CLI 会全程在终端提醒「触发风控、需人工验证、剩余等待时间」；
+    **滑块永远由用户本人拖动，CLI 绝不代拖**。
 
 ### 站点改版了怎么办
 
@@ -375,7 +394,7 @@ scripts/qwb/
   src/browser.mjs       浏览器探测 + 登录三重保险 + cookie 判定
   src/site.mjs          站点层（输入、发送、模式选择器、完成判定、产物下载）
   src/sanitize.mjs      发送前确定性净化闸门
-  src/session.mjs       线程 / 检查点 / 审计
+  src/session.mjs       线程 / 检查点 / 审计 / 全局会话锁
   src/paths.mjs         状态目录布局
   src/logger.mjs        脱敏日志
   tests/sanitize.test.mjs   14 项净化闸门单测

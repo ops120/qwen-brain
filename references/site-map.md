@@ -17,7 +17,12 @@
   - ⚠️ **必须真实鼠标点击**（Playwright locator.click）；
     `element.click()` 合成点击**打不开菜单**（实测踩过）
 - **新建对话**：侧栏「新建对话」按钮（aria「新建对话」）
-- **附件**：`button[aria-label="添加附件"]`（触发隐藏 `input[type=file]`）
+- **附件**：`button[aria-label="添加附件"]` —— 点它**不直接**弹文件选择，
+  先弹菜单（`[role="menuitem"]`）：**「上传文档」/「上传图片」**两项，
+  点菜单项才触发 filechooser。常驻 DOM 里**没有** `input[type=file]`，
+  直接 `setInputFiles` 必报「页面上没有文件输入框」（实测踩过）。
+  必须点按钮 + 接住 Playwright `filechooser` 事件再 `setFiles`；
+  图片扩展名走「上传图片」，其余走「上传文档」（见 `site.mjs uploadAttachments`）
 - **顶栏**：当前底层模型名（如「Qwen3.7-千问」）带下拉——v1 **未接**（见下「模型 vs 模式」）
 
 ## 回答 DOM（⚠️ CSS Modules：class 带随机后缀，必须 `[class*=]` 前缀匹配）
@@ -35,6 +40,18 @@
 `[class*="markdown"]` / `[class*="prose"]`，无则取卡片本身。
 发送前必须记录 `answerCount` 基线，**只认新增**（页面会恢复上次会话）。
 
+### 回答正文抽取的三类污染（实测踩过，EXTRACT_FN 已内置处理）
+
+1. **推荐 / 视频卡片**：回答容器里会挂 `data-card-type="video_note_list"`（知识视频推荐等），
+   `class="card card_card_*"` / `data-tpl` / `data-c="result_card"`。
+   其可见标题会被朴素遍历当成正文（实测：正文末尾粘上「1+1一定等于2吗？换个规则就变了」）。
+   → 整棵子树跳过。
+2. **代码块 chrome**：`<pre>` 外层有固定头（语言名 + 编辑/复制按钮，sticky 条 + button），
+   代码体每行带 `linenumber` 行号 span。
+   → 跳过 sticky 头与行号，正文重排成 ``` 围栏（语言从头栏文本恢复）。
+3. **思考过程 / 工具卡片**：`thinking-content-*` 等在 `answer-common-card` 之外，天然不会采到；
+   若未来并入需另行排除。
+
 ## ⚠️ 输入注入（本站最关键的坑）
 
 **必须**：点击编辑器获得焦点 → `keyboard.insertText(text)` 一次性插入。
@@ -50,8 +67,11 @@
 - 新环境 / 新 profile 首次使用**大概率弹**；通过一次后设备被记住，通常安静一段时间
 - 验证弹窗会**拦住已发出的消息**：回答卡在 `answer-receiving-card` 占位、
   `POST /api/v2/chat` 被 punish，**不会有文本**
-- 处理：检测到验证 → 停止轮询等用户完成（`waitForChallengeCleared`）→
-  通过后**重新发送**（原消息已被拦，不会自动恢复）
+- **滑块一律由用户本人在浏览器里拖动，CLI 绝不代拖**（风控红线）；CLI 的职责是：
+  检测到验证 → 终端明确提醒「触发风控、需要人工验证」+ 周期性播报剩余等待时间 →
+  等待期间**暂停回答超时时钟**（用户拖多久都不烧 `--timeout` 预算）→
+  通过后**立即重新发送**（原消息已被拦、不会自动恢复；旧实现会硬等满 timeout 才重发，已改）
+  → 等待超过 `--captcha-wait` 才报 `HUMAN_VERIFICATION_REQUIRED`（此时不重发）
 - 检测锚点：body 全文匹配 `请拖动下方滑块完成验证|通过验证以确保正常访问`
   （⚠️ 不要按「元素结构」找——弹窗层级深、文本长，结构匹配会漏检，实测踩过）
 

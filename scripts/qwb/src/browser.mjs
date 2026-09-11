@@ -120,15 +120,63 @@ export async function loadPlaywright() {
 }
 
 /**
+ * 回收**孤儿浏览器**：上次 CLI 被强杀（Ctrl-C / 任务取消 / 崩溃）时会留下一个
+ * 仍占用本 profile 的 Chrome 窗口。Chrome 的 profile 是排他锁（ProcessSingleton），
+ * 不清掉的话下一次 launchPersistentContext 会直接失败或连上旧实例。
+ *
+ * 判定依据是命令行里带 `--user-data-dir=<本状态目录>/profile` —— 一定是我们自己
+ * 启动的实例（用户日常 Chrome 用的是默认 profile，不受影响）。
+ */
+export function killOrphanBrowsers() {
+  const profileDir = dirs().profile;
+  const killed = [];
+  try {
+    if (process.platform === "win32") {
+      const ps = [
+        `$p = Get-CimInstance Win32_Process -Filter "Name='chrome.exe' or Name='msedge.exe' or Name='brave.exe'"`,
+        `$p | Where-Object { $_.CommandLine -like '*${profileDir.replace(/'/g, "''")}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; $_.ProcessId }`,
+      ].join("; ");
+      const out = execFileSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", ps], {
+        encoding: "utf8",
+        windowsHide: true,
+        timeout: 15000,
+      });
+      killed.push(...out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
+    } else {
+      const out = execFileSync("ps", ["-Ao", "pid,args"], { encoding: "utf8", timeout: 15000 });
+      for (const line of out.split("\n")) {
+        if (!line.includes(profileDir) || line.includes("grep")) continue;
+        const m = line.trim().match(/^(\d+)/);
+        if (!m) continue;
+        try {
+          process.kill(Number(m[1]), "SIGTERM");
+          killed.push(m[1]);
+        } catch {
+          /* 已退出 */
+        }
+      }
+    }
+  } catch {
+    /* 探测失败不致命，照常尝试启动 */
+  }
+  if (killed.length) log("warn", `回收了 ${killed.length} 个占用本 profile 的孤儿浏览器进程`);
+  return killed.length;
+}
+
+/**
  * 启动持久化浏览器。
  *
  * qianwen.com 要点：
- *   - `--restore-last-session`：Playwright 的 launchPersistentContext 有意不保存
- *     session cookie（microsoft/playwright#36139），该开关让 Chrome 恢复上次会话。
+ *   - **不用 `--restore-last-session`**：该开关会在每次启动时恢复上次会话的所有标签页，
+ *     而 CLI 每次问答都会新开一个标签页 → 标签页数量逐次累加（实测踩过：跑十几次后
+ *     窗口里堆了二十多个千问标签页）。千问的登录 cookie 是**持久型**
+ *     （`tongyi_sso_ticket` / `tongyi_sso_ticket_hash` / `b-user-id` 均带 365 天 Expires，
+ *     实测验证），不依赖 session cookie，因此不需要该 workaround
+ *     —— 删掉开关 + 启动时收敛标签页，登录态照样保留。
  *   - `chromiumSandbox: true`：默认 false 会注入 `--no-sandbox`，
  *     Chrome 会显示「不受支持的命令行标记」警告条，且是自动化特征（招致更严风控）。
  *   - `viewport: null`：固定视口会阻止窗口最大化。
- *   - 优雅关闭（ctx.close()）：强杀会跳过 cookie 落盘，登录态可能丢。
+ *   - 优雅关闭（closeBrowser()）：强杀会跳过 cookie 落盘，登录态可能丢。
  *   - ⚠️ 千问的阿里风控对「全新 profile」会弹滑块验证；profile 复用 + storage_state
  *     注入能显著降低弹验证的概率（第一次通过后一般会安静一段时间）。
  */
@@ -155,7 +203,6 @@ export async function launchBrowser({ headless = false, acceptDownloads = true }
       "--no-first-run",
       "--no-default-browser-check",
       "--start-maximized",
-      "--restore-last-session",
     ],
   };
   if (found.executablePath) launchOpts.executablePath = found.executablePath;
@@ -163,6 +210,9 @@ export async function launchBrowser({ headless = false, acceptDownloads = true }
 
   log("info", `browser launch: ${found.executablePath ?? `channel=${found.channel}`} (via ${found.via}), headless=${headless}`);
 
+  // ⚠️ 必须在持有全局会话锁（acquireLock）之后调用：没锁的话会把另一个
+  // 正在运行的 qwb 会话的浏览器当成孤儿杀掉。
+  killOrphanBrowsers();
   const ctx = await pw.chromium.launchPersistentContext(d.profile, launchOpts);
   ctx.setDefaultTimeout(20000);
 
@@ -238,4 +288,38 @@ export async function readLoginCookies(ctx) {
 export async function openPage(ctx) {
   const pages = ctx.pages();
   return pages.length > 0 ? pages[0] : ctx.newPage();
+}
+
+/**
+ * 收敛到「只留一个标签页」：多余的关掉，返回留下的那个。
+ * 历史 profile 里可能残留上次会话恢复出的一堆标签页（旧版 `--restore-last-session`
+ * 遗留），每次启动清一遍，窗口里始终只有一个页面。
+ */
+export async function collapseToSinglePage(ctx) {
+  const keep = await openPage(ctx);
+  const extras = ctx.pages().filter((p) => p !== keep);
+  for (const p of extras) await p.close().catch(() => {});
+  if (extras.length) log("info", `已关闭 ${extras.length} 个残留标签页，只保留 1 个`);
+  return keep;
+}
+
+/**
+ * 优雅关闭：close() 让 Chrome 走正常退出流程，cookie 才会落盘。
+ * 加超时兜底 —— 个别情况下 close() 会挂住（对话框 / 下载中），
+ * 不能让 CLI 因此卡死。
+ */
+export async function closeBrowser(ctx, { timeoutMs = 15000 } = {}) {
+  let timer;
+  try {
+    await Promise.race([
+      ctx.close(),
+      new Promise((r) => {
+        timer = setTimeout(r, timeoutMs);
+      }),
+    ]);
+  } catch (error) {
+    log("warn", `浏览器关闭异常（已忽略）: ${String(error).slice(0, 120)}`);
+  } finally {
+    clearTimeout(timer);
+  }
 }

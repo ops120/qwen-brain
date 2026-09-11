@@ -4,7 +4,7 @@ description: 把千问网页版（qianwen.com，阿里）当作外部大脑，�
 license: MIT
 allowed-tools: Bash, Read, Write
 metadata:
-  version: 3.0.0
+  version: 3.0.1
   emoji: "🐔"
   requires: node>=20, network to qianwen.com, 阿里系账号（可选，匿名可用）
 ---
@@ -122,8 +122,10 @@ node "<skill-root>/scripts/qwb/cli.mjs" ask --prompt "看下这张图" --attach 
 ## 何时打断用户（一次只给一个动作）
 
 - `HUMAN_VERIFICATION_REQUIRED`：**阿里滑块验证**（新设备 / 新环境更易弹出）。
-  CLI 默认会**留在原地等用户滑完并自动重发**（`--captcha-wait`，默认 180 秒）；
-  超时才报此错。让用户在打开的浏览器里完成拖动。
+  CLI 检测到风控时会在终端**明确提醒**（触发了风控、需要人工验证、周期播报剩余等待时间），
+  然后留在原地等用户拖完并自动重发（`--captcha-wait`，默认 180 秒；
+  **等待期间不计入回答超时**）；超时才报此错。
+  **滑块一律由用户本人在浏览器里拖动，CLI 绝不代拖——风控红线**。
 - `RATE_LIMITED`：说明额度受限与建议等待。
 - 需要用户对敏感数据外发做决定（`SENSITIVE_BLOCKED`）。
 
@@ -131,7 +133,8 @@ node "<skill-root>/scripts/qwb/cli.mjs" ask --prompt "看下这张图" --attach 
 
 ## 预算
 
-- 每任务默认 ≤ 3 次问答；不做批量、不做并发。
+- 每任务默认 ≤ 3 次问答；不做批量、不做并发
+  （CLI 有全局会话锁：并发第二个会话会拿到 `LOCKED`，不会互相打架）。
 - 快速模式常见 8–20 秒；思考研究 1–3 分钟（`--timeout` 给足，默认 300 秒）。
 
 ## 能力边界
