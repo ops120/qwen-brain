@@ -1,8 +1,8 @@
 # 依赖（实际安装在状态目录，这里只做兜底）
 node_modules/
 
-# 本地状态与调试产物（真实状态在 OS 状态目录：%LOCALAPPDATA%\grok-brain）
-.dsb-state/
+# 本地状态与调试产物（真实状态在 OS 状态目录：%LOCALAPPDATA%\qwen-brain）
+.qwb-state/
 debug/
 *.log
 
