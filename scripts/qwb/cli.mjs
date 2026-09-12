@@ -50,6 +50,7 @@ const { values: flags, positionals } = parseArgs({
     "allow-large": { type: "boolean", default: false },
     "keep-open": { type: "boolean", default: false },
     "captcha-wait": { type: "string", default: "180000" },
+    "artifact-wait": { type: "string" },
     verbose: { type: "boolean", default: false },
     lines: { type: "string" },
     n: { type: "string" },
@@ -399,6 +400,50 @@ async function cmdDoctorInner() {
 
 /* ----------------------------------- ask ---------------------------------- */
 
+// 生成类意图：命中时 ask 在文字回答后继续等生图/生视频卡片（见 --artifact-wait）
+const GEN_INTENT_RE =
+  /(生图|生视频|(画|绘|生成|做一|来一)[^\n]{0,24}(图|画|海报|头像|壁纸|插画|照片|视频|影片|动图)|draw[^\n]{0,20}(picture|image|painting)|generate[^\n]{0,20}(image|picture|video))/i;
+
+// 从卡片 hydration 数据的直链下载产物（不走下载按钮——那是悬停 display:none 的非 button 菜单）
+async function downloadByUrl(ctx, art, outDir, base) {
+  try {
+    const resp = await ctx.request.get(art.url, { timeout: 90000 });
+    if (!resp.ok()) {
+      log("warn", `生成产物下载失败 HTTP ${resp.status()}：${art.url.slice(0, 80)}`);
+      return null;
+    }
+    const ct = (resp.headers()["content-type"] ?? "").split(";")[0].trim().toLowerCase();
+    const byType = {
+      "image/png": ".png",
+      "image/jpeg": ".jpg",
+      "image/webp": ".webp",
+      "image/gif": ".gif",
+      "video/mp4": ".mp4",
+      "video/webm": ".webm",
+      "video/quicktime": ".mov",
+    };
+    const ext =
+      byType[ct] ??
+      (/(\.(png|jpe?g|webp|gif|mp4|mov|webm))$/i.exec(decodeURIComponent(new URL(art.url).pathname))?.[1] ??
+        (art.kind === "video" ? ".mp4" : ".png"));
+    const file = path.join(outDir, `qwb-${art.kind}-${base}${ext}`);
+    const buf = await resp.body();
+    fs.writeFileSync(file, buf);
+    return {
+      file,
+      suggested: path.basename(file),
+      bytes: buf.length,
+      kind: art.kind,
+      width: art.width ?? undefined,
+      height: art.height ?? undefined,
+      source: "card-data",
+    };
+  } catch (error) {
+    log("warn", `生成产物下载异常：${String(error).slice(0, 150)}`);
+    return null;
+  }
+}
+
 async function cmdAsk() {
   return withBrowserLock("ask", () => cmdAskInner());
 }
@@ -584,6 +629,36 @@ async function cmdAskInner() {
       log("info", `产物下载: ${JSON.stringify(dl).slice(0, 200)}`);
     }
 
+    // 生图/生视频：文字稳定 ≠ 生成完成（实测图片卡在文字后 ~40-70 秒才渲染完），
+    // 且下载入口是悬停 display:none 的非 button 菜单，按钮扫描不可见——
+    // 直接等卡片 hydration 数据（s-data-card_ai_generate_*）里的原图/视频直链。
+    const genIntent = GEN_INTENT_RE.test(subject);
+    const artifactWaitMs =
+      flags["artifact-wait"] !== undefined
+        ? Number(flags["artifact-wait"]) || 0
+        : genIntent
+          ? 120000
+          : 0;
+    if (ans.ok !== false || genIntent || artifactWaitMs > 0) {
+      if (genIntent || artifactWaitMs > 0) {
+        process.stderr.write(
+          `生成类请求：等待图片/视频卡完成（最多 ${Math.round(artifactWaitMs / 1000)} 秒，文字回答已先行返回）…\n`
+        );
+      }
+      const arts = await site.waitForArtifacts(page, {
+        timeoutMs: artifactWaitMs,
+        onPoll: (info) => log("debug", "waitForArtifacts poll", info),
+      });
+      let n = 0;
+      for (const art of [...arts.images, ...arts.videos]) {
+        const saved = await downloadByUrl(ctx, art, downloadsDir, `${requestId}-${++n}`);
+        if (saved) files.push(saved);
+      }
+      if (arts.images.length || arts.videos.length) {
+        log("info", `生成产物: 卡片数据 ${arts.images.length + arts.videos.length} 个，下载成功 ${files.filter((f) => f.source === "card-data").length} 个`);
+      }
+    }
+
     if (!ans.ok && !ans.text && !files.length) {
       if (ans.reason === "HUMAN_VERIFICATION_REQUIRED") {
         return fail("HUMAN_VERIFICATION_REQUIRED", captchaFailMessage(captchaWaitMs), {
@@ -633,7 +708,7 @@ async function cmdAskInner() {
       modes: { mode: modeAfter ?? modeRes.after, requested: flags.think ?? null },
       text: ans.text ?? "",
       files,
-      mode: ans.mode ?? (files.length ? "artifact" : "chat"),
+      mode: files.length ? "artifact" : (ans.mode ?? "chat"),
       truncated: !ans.ok,
       elapsedMs: ans.elapsedMs ?? Date.now() - startedAt,
       threadLost: threadLost || undefined,
@@ -751,7 +826,7 @@ function usage() {
   setup                 首次配置：装依赖 → 打开浏览器 → 人工登录（可跳过，匿名可用）
   login / logout        重新登录 / 清除登录态
   doctor [--deep] [--html]   体检（--deep 真机探测页面与模式选择器）
-  ask --prompt-file f [--think on] [--attach a.png] [--thread new|<url>] [--json]
+  ask --prompt-file f [--think on] [--attach a.png] [--thread new|<url>] [--artifact-wait <ms>] [--json]
   list-models           列出模式档位（快速 / 思考研究）
   thread status|use <url>|new
   session get|set [...]      工作区线程与 checkpoint
@@ -760,6 +835,7 @@ function usage() {
 
 通用：--json 机器可读；--debug 保存页面 HTML；--keep-open 保留浏览器窗口；
      --captcha-wait <ms> 滑块验证等待时限（默认 180000）
+     --artifact-wait <ms> 生成卡片等待毫秒（命中生成意图时默认 120000；0=只扫一次不等）
 `);
   return { ok: true };
 }

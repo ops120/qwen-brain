@@ -659,3 +659,88 @@ export async function downloadArtifact(page, ctx, outDir, { timeoutMs = 60000 } 
     ? { ok: true, label: used, files: saved }
     : { ok: false, reason: "SEND_FAILED", message: `点击下载后没有触发下载事件（候选：${diag.join(" | ") || "无"}）` };
 }
+
+/* ------------------------------ 生成产物（生图 / 生视频） ------------------------------ */
+
+/**
+ * 生图/生视频卡片的产物抽取。不走下载按钮：卡片的下载入口是悬停才显示的
+ * popMenu（CSS 默认 display:none），且菜单项不是 <button>、无 aria-label/title——
+ * 按钮扫描对它天然不可见（实测 2026-09）。
+ * 可靠入口是卡片自带的 hydration 数据：`<script type="application/json"
+ * id="s-data-card_ai_generate_*">` 里的 download_url / cdn_url（原图直链，含 width/height）。
+ */
+export const GEN_ARTIFACTS_FN = () => {
+  const vis = (e) => !!e && e.getClientRects().length > 0;
+  const answers = [...document.querySelectorAll('[class*="answer-common-card"]')].filter(vis);
+  const last = answers[answers.length - 1];
+  if (!last) return { images: [], videos: [] };
+
+  const seen = new Set();
+  const images = [];
+  const videos = [];
+  const MEDIA_RE = /\.(png|jpe?g|webp|gif|bmp|mp4|mov|webm|avi|mkv)(\?|#|$)/i;
+  const VIDEO_URL_RE = /\.(mp4|mov|webm|avi|mkv)(\?|#|$)/i;
+
+  const push = (node, url) => {
+    if (!url || typeof url !== "string" || !/^https?:/.test(url) || seen.has(url)) return;
+    if (/x-oss-process|\/preview|preview_url/.test(url)) return; // 预览缩略图不要
+    seen.add(url);
+    const isVideo = node?.video_url != null || node?.duration != null || VIDEO_URL_RE.test(url);
+    (isVideo ? videos : images).push({
+      url,
+      kind: isVideo ? "video" : "image",
+      width: node?.width ?? null,
+      height: node?.height ?? null,
+    });
+  };
+
+  // 结构未知，深搜所有含产物直链的对象（download_url 最优先 = 无压缩原图）
+  const walk = (node) => {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) return node.forEach(walk);
+    if (typeof node.download_url === "string" && /^https?:/.test(node.download_url)) push(node, node.download_url);
+    else {
+      for (const k of ["cdn_url", "url", "video_url", "image_url"]) {
+        const u = node[k];
+        if (typeof u === "string" && MEDIA_RE.test(u)) {
+          push(node, u);
+          break;
+        }
+      }
+    }
+    Object.values(node).forEach(walk);
+  };
+
+  for (const sc of last.querySelectorAll('script[type="application/json"]')) {
+    const id = sc.id || "";
+    if (!/^(s-data-card_|.*ai_generate)/i.test(id)) continue;
+    try {
+      walk(JSON.parse(sc.textContent || "null"));
+    } catch {
+      /* 半成品 JSON 忽略，等下一轮 */
+    }
+  }
+  // <video> 元素兜底（视频卡可能有 hydration 之外的播放源）
+  for (const v of [...last.querySelectorAll("video")].filter(vis)) {
+    const u = v.currentSrc || v.src || "";
+    if (u) push({ width: v.videoWidth || undefined, height: v.videoHeight || undefined, duration: v.duration }, u);
+  }
+  return { images, videos };
+};
+
+/**
+ * 等生成产物：**文字回答稳定 ≠ 生成完成** —— 实测生图卡在文字后 ~40-70 秒才渲染完
+ * （从发送起算），期间页面还可能从草稿线程重定向到正式线程（DOM 重建）。
+ * 每轮对当前 DOM 重新抽取，直到拿到产物或超时；timeoutMs=0 时只做一次立即扫描
+ * （非生成类问答零额外等待）。
+ */
+export async function waitForArtifacts(page, { timeoutMs = 0, pollMs = 3000, onPoll } = {}) {
+  let found = await page.evaluate(GEN_ARTIFACTS_FN).catch(() => null);
+  const started = Date.now();
+  while (!found?.images?.length && !found?.videos?.length && Date.now() - started < timeoutMs) {
+    if (onPoll) onPoll({ elapsedMs: Date.now() - started });
+    await page.waitForTimeout(pollMs).catch(() => {});
+    found = await page.evaluate(GEN_ARTIFACTS_FN).catch(() => null);
+  }
+  return found ?? { images: [], videos: [] };
+}

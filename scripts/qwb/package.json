@@ -1,6 +1,6 @@
 {
   "name": "qwb",
-  "version": "3.0.0",
+  "version": "3.0.2",
   "private": true,
   "type": "module",
   "description": "qwen-brain 机制层：驱动 qianwen.com 网页版的确定性 CLI",
